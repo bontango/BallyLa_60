@@ -12,6 +12,9 @@
  *      refreshIsr commits free-running each ~13ms (zero-cross hold emulation;
  *      13ms > measured ~11.3ms worst-case per-lamp refresh gap from digital.csv).
  *      Fixes attract 4x4 matrix lamps staying dark/flickering on KISS.
+ * v006 v004/v005 were broken (read data at +3us = always 1111 -> no lamp ON).
+ *      Data is valid only while address lines are at 15 (+13..+37us after strobe),
+ *      Int0_Isr now waits for address==15 and reads the data there.
  *  */
 
 #include "def.h"
@@ -20,7 +23,7 @@
 #include <string.h>
 
 //version
-#define VERSION 5
+#define VERSION 6
 #define S1_LONG_TIMEOUT 20
 //global vars
 volatile int count_int0 = 0;
@@ -364,28 +367,37 @@ update_ff();
 }
 
 // RB0 / Strobe interrupt
-// Read address AND inhibit/data together in ONE coherent PORTA read,
-// shortly after the strobe edge.
+// read address at the strobe edge, then wait for the data phase and read data (inhibit)
 //
-// Timing background (verified against LogicPort scan lamps.LPF, 100ns/sample):
-//  - Bally drives address+data first, THEN pulses the strobe -> the data is
-//    already valid at the strobe edge (~25us setup) and stays valid only
-//    ~13us afterwards.
-//  - The previous __delay_us(20) read the bus AFTER it had already advanced to
-//    the next/rest state -> wrong lamp data on fast machines (ghost lamps).
-//  - 3us is just a short settle reserve, well within the ~13us hold window.
+// Bus protocol per address (verified against LogicPort scan lamps.LPF, 144 strobes):
+//  phase 1: address = A,  data = 1111 (all off)  ~28us, strobe pulse latches the address
+//  phase 2: address = 15, data = lamp data      from +13.1us to +37.3us after falling edge
+// At the strobe edge the data is ALWAYS 1111 (that was the v004/v005 bug).
+// Instead of a fixed delay (v003: 20us) we wait until the address lines go to 15,
+// so the read point follows the protocol and not the timing of a specific MPU.
+#define DATA_PHASE_TIMEOUT 50   // max wait for address==15 in us
 void __interrupt(irq(INT0),high_priority) Int0_Isr(void)    {
 
-uint8_t porta, address;
+uint8_t porta, address, timeout;
 
 
   PIR1bits.INT0IF = 0;  // clear this interrupt condition
 
-  __delay_us(3);          // short settle reserve, << 13us data-hold window
-  porta   = PORTA;        // ONE coherent read: low nibble = address, high nibble = inhibit
-  address = porta & 0x0f; // lower 4 bits = address
+  //read address, stable until ~13us after the falling edge
+  address = PORTA & 0x0f; // lower 4 bits = address
 
   if ( address != 15) {      //address == 15 for this board is rest position
+    //wait for data phase (address lines go to 15)
+    timeout = DATA_PHASE_TIMEOUT;
+    while ( (PORTA & 0x0f) != 0x0f ) {
+        if ( --timeout == 0 ) return; //no data phase seen, ignore this strobe
+        __delay_us(1);
+    }
+    //short settle time, address and data lines do not switch exactly together
+    __delay_us(2);
+    porta = PORTA;
+    if ( (porta & 0x0f) != 0x0f ) return; //bus moved on already, ignore this strobe
+
     // SCR/thyristor latch: every lamp triggered ON (inhibit bit == 0) is latched
     // immediately into the accumulator lamp_int[] and held until the next
     // zero-cross commit (refreshIsr). Independent of WHEN in the multiplex cycle

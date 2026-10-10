@@ -10,15 +10,15 @@ Quellen: `main.c`, `def.h`.
 
 ---
 
-## Funktionsprinzip
+## Funktionsprinzip (ab v006)
 
-- **INT0 (RB0 / Strobe):** Pro Adress-Strobe wird die Lampen-Adresse und das
-  Inhibit-/Datenwort aus `PORTA` gelesen und in `lamp_aux_inhibit[address]`
-  abgelegt.
-- **Timer2 (One-Shot, Refresh):** 2 ms nach dem Strobe mit Adresse 0 werden die
-  gesammelten Zustände in die „echte" Matrix (`lamp[]`) übernommen. Das
-  emuliert das Thyristor-Verhalten (Lampe bleibt bis zum nächsten Nulldurchgang
-  an; Bally refresht jeden Nulldurchgang, 10 ms @ 50 Hz / 8 ms @ 60 Hz).
+- **INT0 (RB0 / Strobe, fallende Flanke):** Adresse aus `PORTA & 0x0F` lesen,
+  dann warten, bis die Adressleitungen auf 15 gehen (Datenphase), und dort das
+  Inhibit-/Datenwort (`PORTA` High-Nibble) lesen. Jede Lampe mit Inhibit-Bit = 0
+  wird in `lamp_int[]` gesetzt (Akkumulator).
+- **Timer2 (freilaufend, ~13 ms):** Übernimmt `lamp_int[]` nach `lamp[]` und
+  löscht den Akkumulator. Emuliert das Thyristor-Verhalten (Lampe bleibt bis zum
+  nächsten Nulldurchgang an; Bally refresht jeden Nulldurchgang, 10 ms @ 50 Hz).
 - **Hauptschleife / `update_ff()`:** Bei Änderung werden die 8 Flip-Flops
   (74HC574) über `LATC`/`A0..A2` neu beschrieben.
 - **IOC (RB6/RB7):** Tasten S1/S2 für den Testmodus.
@@ -27,8 +27,7 @@ Quellen: `main.c`, `def.h`.
 
 ## Befund aus dem Logic-Analyzer-Scan (`lamps.LPF`)
 
-LogicPort-Aufzeichnung, **Sample-Periode 100 ns** (bestätigt über
-`AcquiredSamplePeriod` und `CursorOffsetTime/Samples`). Das `.LPF` ist
+LogicPort-Aufzeichnung, **Sample-Periode 100 ns**. Das `.LPF` ist
 lauflängencodiert; die Spalte `Count` = Anzahl 100-ns-Samples, die ein Zustand
 anhält.
 
@@ -37,112 +36,75 @@ anhält.
 | Kanal       | Bedeutung                                            |
 |-------------|------------------------------------------------------|
 | **D0**      | STROBE (RB0 / INT0), aktiv-HIGH-Puls, ~10 µs breit   |
-| **D8–D11**  | Lampen-Adresse (RA0–RA3), 4 Bit binär, D8 = LSB, 15 = Rest |
+| **D8–D11**  | Lampen-Adresse (RA0–RA3), 4 Bit binär, D8 = LSB      |
 | **D12–D15** | Inhibit/Daten (RA4–RA7), **0 = Lampe AN**            |
 
-### Gemessenes Timing (ein Adresszyklus, Beispiel Adresse 1)
+### Busprotokoll: zwei Phasen pro Adresse
 
 ```
-Daten gültig ab        t = 1928.2 µs   (addr=1, data=1111)
-Strobe steigt          t = 1943.3 µs   (Daten schon ~15 µs gültig)
-Strobe fällt (INT0!)   t = 1953.3 µs   <- Firmware-Trigger (fallende Flanke)
-Daten gültig bis       t = 1966.5 µs   (= nur ~13.1 µs nach fallender Flanke)
-danach Bus -> Rest:    [addr=1111 | data=0000]
+Phase 1  addr = A,  data = 1111 (alle AUS)   ~28 µs, Strobe-Puls mittendrin
+                                             (latcht die Adresse in die 4514)
+Phase 2  addr = 15, data = Lampendaten       ~24 µs   <- nur hier stehen die Daten
 ```
 
-Kennzahlen über den gesamten Scan:
+Auswertung aller 144 fallenden Strobe-Flanken im Scan:
 
-- Strobe-Periode (Adresse → Adresse): **~62.6 µs**
-- **Datenhaltezeit nach fallender Strobe-Flanke: nur ~13.1 µs** (min/median/max 13.1 / 13.1 / 13.2)
-- Daten-Setup **vor** der Flanke: ~25 µs (sehr stabil)
-- Voller 15-Adressen-Scan: ~1.5 ms, Wiederholung ~alle 10 ms (→ 50-Hz-Maschine)
+- Daten **an der Flanke: 144 × `1111`**, also immer „alle aus“.
+- Echte Daten liegen von **+13,1 µs bis +37,3 µs** nach der fallenden Flanke an,
+  genau solange die Adressleitungen auf 15 stehen.
+- Zwischen Adress- und Datenleitungen gibt es beim Phasenwechsel ~1 Sample Skew.
+- Strobe-Periode ~62,6 µs, voller Scan ~1,5 ms, Wiederholung ~alle 10 ms.
 
 ---
 
-## Fehlerursache: „fehlerhafte Lampenansteuerung bei einigen Flippern"
+## Versionsgeschichte des Lesezeitpunkts
 
-Die alte `Int0_Isr()` las die Adresse korrekt an der Flanke, wartete dann aber
-`__delay_us(20)` und las **erst danach** die Daten:
+| Version | Lesezeitpunkt Daten        | Ergebnis |
+|---------|----------------------------|----------|
+| v003    | fest +20 µs nach Flanke    | trifft hier das Fenster 13–37 µs; bei anderer MPU-Timing-Lage evtl. nicht → vermutlich „Fehler bei einigen Flippern“ |
+| v004/v005 | +3 µs nach Flanke        | **defekt**: liest immer `1111`, keine Lampe geht an (nur Testmodus funktioniert) |
+| v006    | wenn Adresse = 15 (+2 µs Einschwingzeit) | an das Protokoll gekoppelt, unabhängig vom Maschinen-Timing |
+
+Die Analyse zu v004 hatte angenommen, die Daten seien schon an der Strobe-Flanke
+gültig, und den Wert an der Flanke als Referenz genommen. Dadurch sah das
+Lesen bei +3 µs fälschlich „105/105 korrekt“ aus.
+
+### Lesepfad v006 (`Int0_Isr`)
 
 ```c
-address = PORTA & 0x0f;          // korrekt an der Strobe-Flanke
+address = PORTA & 0x0f;                 // Adresse, stabil bis ~13 µs nach Flanke
 if (address != 15) {
-    if (address == 0) T2CONbits.TMR2ON = 1;
-    __delay_us(20);              // <-- 20 µs warten
-    inhibit = PORTA;             // <-- Bus ist nach ~13 µs schon weitergeschaltet!
-    lamp_aux_inhibit[address] = inhibit;
+    timeout = DATA_PHASE_TIMEOUT;       // 50 µs
+    while ((PORTA & 0x0f) != 0x0f) {    // auf Datenphase warten
+        if (--timeout == 0) return;     // keine Datenphase -> Strobe verwerfen
+        __delay_us(1);
+    }
+    __delay_us(2);                      // Skew Adress-/Datenleitungen abwarten
+    porta = PORTA;
+    if ((porta & 0x0f) != 0x0f) return; // Bus schon weiter -> verwerfen
+    ... lamp_int[] aus porta-Bits 4..7 setzen
 }
 ```
 
-Da die Daten nur **~13 µs** nach der Flanke stabil sind, liest das 20-µs-Warten
-den **nächsten** Buszustand – meist den Rest-Zustand `data=0000`. Wegen
-`0 = Lampe AN` werden so Lampen eingeschaltet, die eigentlich AUS sein sollen →
-**geisterhafte/falsche Lampen**.
-
-**Warum nur „einige" Flipper?** Das hartkodierte `__delay_us(20)` ist die
-fragile Größe. Strobe-Periode und Datenhaltezeit variieren je nach Spiel/MPU,
-Netzfrequenz (50/60 Hz) und Takt. Langsamere Maschinen (Haltezeit > 20 µs)
-treffen noch ins Fenster → funktionieren; schnellere (62 µs Periode, 13 µs Hold)
-nicht. Zusätzlich waren Adresse und Daten **zwei getrennte Reads** (möglicher
-Skew).
-
-### Auswertung (Re-Simulation gegen den Scan)
-
-Lesezeitpunkt nach der Strobe-Flanke vs. „an der Flanke gültiger" Wert:
-
-| Read-Zeitpunkt | korrekt gelesene Strobes |
-|----------------|--------------------------|
-| +0 µs          | **105 / 105**            |
-| +3 µs          | **105 / 105** (gewählt)  |
-| +5 µs          | **105 / 105**            |
-| **+20 µs (alt)** | **0 / 105**            |
+Re-Simulation gegen `lamps.LPF` (0,5 µs ISR-Latenz angenommen): alle 105
+Strobes mit Adresse ≠ 15 lesen den Wert der Datenphase.
 
 ---
 
-## Lösung
+## Bekannte Annahmen / offene Punkte
 
-`Int0_Isr()` liest Adresse **und** Inhibit/Daten in **einem kohärenten
-`PORTA`-Read** kurz nach der Strobe-Flanke; nur noch `__delay_us(3)` als
-Einschwing-Reserve (≪ 13 µs Haltezeit):
-
-```c
-PIR1bits.INT0IF = 0;
-__delay_us(3);                 // kurze Einschwing-Reserve, << 13 µs Haltezeit
-porta   = PORTA;               // EIN kohärenter Read: low nibble = Adresse, high nibble = Inhibit
-address = porta & 0x0f;
-if (address != 15) {
-    if (address == 0) T2CONbits.TMR2ON = 1;
-    lamp_aux_inhibit[address] = porta;
-}
-```
-
-Korrekt und maschinenunabhängig, weil die Bally-MPU immer **erst Adresse+Daten,
-dann Strobe** setzt → die Daten sind an der Flanke garantiert gültig. Ein
-einzelner Read macht Adresse und Daten atomar konsistent. Die ISR-Dauer sinkt
-von ~20 µs auf ~3 µs (~32 % → < 5 % CPU-Last pro Strobe), was verpasste Strobes
-auf schnellen Maschinen zusätzlich vorbeugt.
-
----
-
-## Bekannte Annahmen / mögliche künftige Härtung
-
-- **Timer2-Refresh-Fenster:** Der Refresh feuert fix 2 ms nach Adresse 0; setzt
-  voraus, dass alle 15 Adressen innerhalb dieser 2 ms gestrobt werden (im Scan:
-  ~1.5 ms → passt). Bei sehr langsamen/zerstückelten Scans (> 2 ms ab Adr 0)
-  könnte der Refresh mitten im Scan feuern (partielles Update/Flackern) →
-  ggf. adaptiv lösen.
-- **`lamp_aux_inhibit[]`** behält Werte für Adressen, die nicht mehr gestrobt
-  werden. Unkritisch, solange jede Adresse pro Scan gestrobt wird (Normalfall).
+- Das v005-Refresh-Modell (freilaufend 13 ms, Akkumulator) ist erst ab v006
+  real testbar, weil v005 wegen des Lesefehlers nie Daten bekam. Bei Flackern:
+  Rückfall auf den v003-Refresh (One-Shot 2 ms nach Adresse 0) mit dem neuen
+  Lesepfad.
+- Der CMake-Build (VSCode) setzt `__DEBUG=1`; für Release-Hexe ggf. eine
+  Production-Konfiguration verwenden.
 
 ---
 
 ## Verifikation / Test
 
-1. **Build:** Projekt in MPLAB X / VSCode (XC8 v3.10, Device PIC18F25K42) bauen →
-   `out/BallyLa_60/default.hex`. (Syntax-Compile mit `xc8-cc.exe` läuft sauber durch.)
-2. **Hardware – betroffene (schnelle) Maschine:** Im Ruhezustand/Attract dürfen
-   keine Geisterlampen mehr leuchten; einzelne Lampen gezielt schalten und gegen
-   das erwartete Spielverhalten prüfen.
-3. **Gegentest:** Auf einer bisher funktionierenden (langsamen) und einer bisher
-   fehlerhaften (schnellen) Maschine testen, um zu bestätigen, dass die
-   flankenbasierte Lesung beide Fälle abdeckt.
+1. **Build:** in VSCode (XC8 v3.10, PIC18F25K42) → `out/BallyLa_60/default.hex`.
+2. **Teststand mit CPU:** Versionsanzeige „6“, danach Attract-Lampen sichtbar;
+   Testmodus weiterhin ok.
+3. **Maschinen:** KISS (4x4-Attract-Matrix) und eine bisher problematische Maschine.
